@@ -37,44 +37,64 @@ pub const ThreadContext = struct {
     }
 };
 
-const Lane = struct {
-    lane_index: u32 = 0,
-    lane_count: u32 = 1,
-    broadcast_memory: [std.atomic.cache_line]u8,
+pub const Lane = struct {
+    index: u32 = 0,
+    count: u32 = 1,
+    broadcast_memory: []u8 = .empty,
     barrier: ?*Barrier = null,
     const single: Lane = .{};
+
+    pub fn sync(lane: *Lane, io: std.Io) void {
+        // single lane case
+        if (lane.barrier == null) {
+            std.debug.assert(lane.index == 0);
+            std.debug.assert(lane.count == 1);
+            return;
+        }
+
+        lane.barrier.?.wait(io);
+    }
+
+    pub fn broadcastSync(
+        lane: *Lane,
+        T: type,
+        broadcast_ptr: *T,
+        src_lane_idx: u32,
+        io: std.Io,
+    ) void {
+        comptime {
+            std.debug.assert(@sizeOf(T) <= std.atomic.cache_line);
+        }
+
+        // single lane case
+        if (lane.barrier == null) {
+            std.debug.assert(lane.index == 0);
+            std.debug.assert(lane.count == 1);
+            return;
+        }
+
+        const len = @sizeOf(T);
+
+        // copy to broadcast memory on source lane
+        if (src_lane_idx == lane.index) {
+            const src: []u8 = std.mem.asBytes(broadcast_ptr);
+            const dst: []u8 = lane.broadcast_memory[0..len];
+            @memcpy(dst, src);
+        }
+
+        lane.barrier.?.wait(io);
+
+        // copy from broadcast memory on destination lanes
+        if (src_lane_idx != lane.index) {
+            const src: []u8 = lane.broadcast_memory[0..len];
+            const dst: []u8 = std.mem.asBytes(broadcast_ptr);
+            @memcpy(src, dst);
+        }
+    }
 };
 
-// threadlocal var current_lane: ?Lane = null;
-
-// pub const Lane = struct {
-//     /// lane index in the group
-//     index: u32,
-//     /// lane group this lane belongs to
-//     group: *LaneGroup,
-//     /// lane-local arena, guaranteed to not be contended
-//     arena: std.heap.ArenaAllocator,
-//
-//     pub const Memo = struct { idx: u32, group: *LaneGroup };
-// };
-//
-// const LaneGroup = struct {
-//     io: std.Io,
-//     gpa: std.mem.Allocator,
-//
-//     /// number of lanes in the group
-//     count: u32,
-//     barrier: Barrier,
-//     slots: []Slot,
-//     counter: atomic.Value(usize), // for dynamic ranges
-//
-// };
-//
-// const Slot = struct {
-//     bytes: [cache_line]u8 align(cache_line),
-// };
-
 const Barrier = struct {
+    /// number of expected waiters
     expected: u32,
     spin_limit: u32 = 256, // chosen by throwing a dart at the wall
     arrived: std.atomic.Value(u32) = .init(0),
