@@ -49,11 +49,49 @@ pub const Lane = union(enum) {
 
     pub fn sync(lane: *Lane, io: std.Io) void {
         // single lane case
-        if (lane == .single) return;
-        lane.grouped.barrier.?.wait(io);
+        if (lane.* == .single) return;
+        lane.grouped.barrier.wait(io);
     }
 
-    pub fn broadcastSync(
+    test sync {
+        const num_lanes = 4;
+        const io = std.testing.io;
+
+        const Shared = struct {
+            data: [num_lanes]u32 = @splat(0),
+            ok: std.atomic.Value(u32) = .init(0),
+        };
+        var shared: Shared = .{};
+        var barrier: Barrier = .{ .expected = num_lanes };
+        var memory: [std.atomic.cache_line]u8 align(std.atomic.cache_line) = undefined;
+
+        const Worker = struct {
+            fn run(s: *Shared, b: *Barrier, mem: *[std.atomic.cache_line]u8, io_: std.Io, idx: u32) void {
+                var lane: Lane = .{ .grouped = .{
+                    .index = idx,
+                    .count = num_lanes,
+                    .broadcast_memory = mem,
+                    .barrier = b,
+                } };
+                s.data[idx] = idx + 1;
+                lane.sync(io_);
+                // after sync, every lane sees every other lane's write
+                for (s.data, 0..) |v, i| {
+                    if (v == i + 1) _ = s.ok.fetchAdd(1, .monotonic);
+                }
+            }
+        };
+
+        var futures: [num_lanes]std.Io.Future(void) = undefined;
+        for (&futures, 0..) |*f, i| {
+            f.* = try io.concurrent(Worker.run, .{ &shared, &barrier, &memory, io, @as(u32, @intCast(i)) });
+        }
+        for (&futures) |*f| f.await(io);
+
+        try std.testing.expectEqual(@as(u32, num_lanes * num_lanes), shared.ok.load(.monotonic));
+    }
+
+    pub fn broadcast(
         lane: *Lane,
         /// type of data being broadcast
         T: type,
@@ -68,7 +106,7 @@ pub const Lane = union(enum) {
         }
 
         // single lane case
-        if (lane == .single) return;
+        if (lane.* == .single) return;
 
         // copy to broadcast memory on source lane
         const len = @sizeOf(T);
@@ -80,21 +118,55 @@ pub const Lane = union(enum) {
             @memcpy(dst, src);
         }
 
-        lane.grouped.barrier.?.wait(io);
+        lane.grouped.barrier.wait(io);
 
         // copy from broadcast memory on destination lanes
-        if (src_lane_idx != lane.index) {
+        if (src_lane_idx != lane.grouped.index) {
             const src: []u8 = lane.grouped.broadcast_memory[0..len];
             const dst: []u8 = std.mem.asBytes(broadcast_ptr);
             std.debug.assert(src.len == len);
             std.debug.assert(dst.len == len);
-            @memcpy(src, dst);
+            @memcpy(dst, src);
         }
+
+        // don't let the source lane reuse broadcast memory until everyone has read it
+        lane.grouped.barrier.wait(io);
     }
 
-    pub inline fn assertValid(lane: *Lane) void {
-        if (lane == .single) return;
-        std.debug.assert(lane.grouped.index < lane.grouped.count);
+    test broadcast {
+        const num_lanes = 4;
+        const src_lane = 2;
+        const io = std.testing.io;
+
+        const Shared = struct {
+            received: [num_lanes]u64 = @splat(0),
+        };
+        var shared: Shared = .{};
+        var barrier: Barrier = .{ .expected = num_lanes };
+        var memory: [std.atomic.cache_line]u8 align(std.atomic.cache_line) = undefined;
+
+        const Worker = struct {
+            fn run(s: *Shared, b: *Barrier, mem: *[std.atomic.cache_line]u8, io_: std.Io, idx: u32) void {
+                var lane: Lane = .{ .grouped = .{
+                    .index = idx,
+                    .count = num_lanes,
+                    .broadcast_memory = mem,
+                    .barrier = b,
+                } };
+                // only the source lane starts with the real value
+                var value: u64 = if (idx == src_lane) 0xBEEF else 0;
+                lane.broadcast(u64, &value, src_lane, io_);
+                s.received[idx] = value;
+            }
+        };
+
+        var futures: [num_lanes]std.Io.Future(void) = undefined;
+        for (&futures, 0..) |*f, i| {
+            f.* = try io.concurrent(Worker.run, .{ &shared, &barrier, &memory, io, @as(u32, @intCast(i)) });
+        }
+        for (&futures) |*f| f.await(io);
+
+        for (shared.received) |v| try std.testing.expectEqual(@as(u64, 0xBEEF), v);
     }
 };
 
@@ -104,7 +176,7 @@ const Barrier = struct {
     spin_limit: u32 = 256, // chosen by throwing a dart at the wall
     arrived: std.atomic.Value(u32) = .init(0),
     sleepers: std.atomic.Value(u32) = .init(0),
-    generation: std.atomic.value(u32) = .init(0),
+    generation: std.atomic.Value(u32) = .init(0),
 
     fn wait(barrier: *Barrier, io: std.Io) void {
         // load generation before arriving
@@ -115,7 +187,7 @@ const Barrier = struct {
             barrier.arrived.store(0, .monotonic);
             barrier.generation.store(gen +% 1, .seq_cst);
             if (barrier.sleepers.load(.seq_cst) != 0) {
-                io.futexWake(&barrier.generation, std.math.maxInt(u32));
+                io.futexWake(u32, &barrier.generation.raw, std.math.maxInt(u32));
             }
             return;
         }
@@ -130,7 +202,7 @@ const Barrier = struct {
         // otherwise sleep
         _ = barrier.sleepers.fetchAdd(1, .seq_cst);
         while (barrier.generation.load(.seq_cst) == gen) {
-            io.futexWaitUncancelable(&barrier.generation, gen);
+            io.futexWaitUncancelable(u32, &barrier.generation.raw, gen);
         }
         _ = barrier.sleepers.fetchSub(1, .monotonic);
     }
@@ -146,7 +218,7 @@ const Barrier = struct {
             data: [2][num_lanes]u32 = @splat(@splat(0)),
             success: std.atomic.Value(bool) = .init(false),
         };
-        var shared: Shared = .{ .barrier = .{ .count = num_lanes, .spin_limit = spin_limit } };
+        var shared: Shared = .{ .barrier = .{ .expected = num_lanes, .spin_limit = spin_limit } };
 
         const Worker = struct {
             fn run(s: *Shared, io_: std.Io, idx: u32, rounds_: u32) void {
