@@ -37,28 +37,29 @@ pub const ThreadContext = struct {
     }
 };
 
-pub const Lane = struct {
-    index: u32 = 0,
-    count: u32 = 1,
-    broadcast_memory: []u8 = .empty,
-    barrier: ?*Barrier = null,
-    const single: Lane = .{};
+pub const Lane = union(enum) {
+    single,
+    grouped: struct {
+        index: u32,
+        count: u32,
+        /// slice of memory shared by all lanes
+        broadcast_memory: *[std.atomic.cache_line]u8,
+        barrier: *Barrier,
+    },
 
     pub fn sync(lane: *Lane, io: std.Io) void {
         // single lane case
-        if (lane.barrier == null) {
-            std.debug.assert(lane.index == 0);
-            std.debug.assert(lane.count == 1);
-            return;
-        }
-
-        lane.barrier.?.wait(io);
+        if (lane == .single) return;
+        lane.grouped.barrier.?.wait(io);
     }
 
     pub fn broadcastSync(
         lane: *Lane,
+        /// type of data being broadcast
         T: type,
+        /// source pointer  on src lane, destination pointer on all other lanes
         broadcast_ptr: *T,
+        /// index of the source lane
         src_lane_idx: u32,
         io: std.Io,
     ) void {
@@ -67,29 +68,33 @@ pub const Lane = struct {
         }
 
         // single lane case
-        if (lane.barrier == null) {
-            std.debug.assert(lane.index == 0);
-            std.debug.assert(lane.count == 1);
-            return;
-        }
-
-        const len = @sizeOf(T);
+        if (lane == .single) return;
 
         // copy to broadcast memory on source lane
-        if (src_lane_idx == lane.index) {
+        const len = @sizeOf(T);
+        if (src_lane_idx == lane.grouped.index) {
             const src: []u8 = std.mem.asBytes(broadcast_ptr);
-            const dst: []u8 = lane.broadcast_memory[0..len];
+            const dst: []u8 = lane.grouped.broadcast_memory[0..len];
+            std.debug.assert(src.len == len);
+            std.debug.assert(dst.len == len);
             @memcpy(dst, src);
         }
 
-        lane.barrier.?.wait(io);
+        lane.grouped.barrier.?.wait(io);
 
         // copy from broadcast memory on destination lanes
         if (src_lane_idx != lane.index) {
-            const src: []u8 = lane.broadcast_memory[0..len];
+            const src: []u8 = lane.grouped.broadcast_memory[0..len];
             const dst: []u8 = std.mem.asBytes(broadcast_ptr);
+            std.debug.assert(src.len == len);
+            std.debug.assert(dst.len == len);
             @memcpy(src, dst);
         }
+    }
+
+    pub inline fn assertValid(lane: *Lane) void {
+        if (lane == .single) return;
+        std.debug.assert(lane.grouped.index < lane.grouped.count);
     }
 };
 
@@ -175,52 +180,6 @@ pub const Range = struct { start: usize, end: usize };
 pub const Error = error{
     uninitialized,
 };
-
-// // ---- launch ----
-// pub fn run(gpa: Allocator, lane_count: ?u32, comptime f: anytype, args: anytype) !void {
-//     @panic("TODO");
-// }
-//     // Spawns count-1 threads; the calling thread is lane 0. f receives *Lane.
-//
-// // ---- identity ----
-// pub fn count(l: *const Lane) u32 {
-//     @panic("TODO");
-// }
-// pub fn isFirst(l: *const Lane) bool {
-//     @panic("TODO");
-// }
-//
-// // ---- sync ----
-// pub fn sync(l: *Lane) void {
-//     @panic("TODO");
-// }
-//
-// // ---- work splitting ----
-// pub fn splitRange(n: usize, parts: u32, i: u32) Range   // pure math
-// pub fn range(l: *const Lane, n: usize) Range            // static even split
-// pub fn dynamic(l: *Lane, n: usize, chunk: usize) DynamicIter  // syncs, then atomic claiming
-//     // DynamicIter.next() ?Range
-//
-// // ---- collectives (values ≤ one cache line) ----
-// pub fn broadcast(l: *Lane, comptime T: type, v: T, src: u32) T
-// pub fn reduce(l: *Lane, comptime T: type, v: T, comptime op: std.builtin.ReduceOp) T
-// pub fn gather(l: *Lane, comptime T: type, v: T, out: []T) void
-//
-// // ---- memory ----
-// pub fn arena(l: *Lane) Allocator
-// pub fn gpa(l: *const Lane) Allocator
-// pub fn allocShared(l: *Lane, comptime T: type, n: usize) ![]T  // lane 0 allocs, broadcasts
-// pub fn freeShared(l: *Lane, comptime T: type, s: []T) void     // sync, then lane 0 frees
-// pub fn syncResetArena(l: *Lane) void                           // sync, then reset own arena
-//
-// // ---- subgroups ----
-// pub fn split(l: *Lane, n_groups: u32) !Membership  // switch into a subgroup
-// pub fn join(l: *Lane, prev: Membership) void       // restore, sync, lane 0 frees children
-//
-// pub fn current() *Lane {
-//     assert(current_lane != null);
-//     return current_lane.?;
-// }
 
 test {
     std.testing.refAllDecls(@This());
