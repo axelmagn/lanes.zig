@@ -27,7 +27,6 @@ pub const LaunchOptions = struct {
 pub fn init(safe_gpa: std.mem.Allocator, threaded_io: *std.Io.Threaded) void {
     const arena = std.heap.ArenaAllocator.init(safe_gpa);
     thread_context = .{
-        .initialized = true,
         .safe_gpa = safe_gpa,
         .io = threaded_io.io(),
         .arena = arena,
@@ -165,4 +164,11 @@ pub fn getArena() Error!*std.heap.ArenaAllocator {
 
 fn expectInitialized(tctx: ThreadContext) Error!void {
     if (!tctx.initialized) return Error.uninitialized;
+}
+
+test {
+    _ = std.testing.refAllDecls(@This());
+    // refAllDecls only sees pub decls, so reference the private imports explicitly
+    _ = Barrier;
+    _ = Lane;
 }

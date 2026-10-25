@@ -69,7 +69,7 @@ test range {
 
                 // expect: evenly distributed
                 min_len = @min(min_len, range_res.len());
-                max_len = @min(max_len, range_res.len());
+                max_len = @max(max_len, range_res.len());
                 try std.testing.expect(max_len - min_len < 2);
 
                 // expect: sequential
@@ -94,42 +94,35 @@ pub fn sync(lane: *Lane, io: std.Io) Error!void {
     try lane.barrier.wait(io);
 }
 
-test "Lane.sync" {
+test sync {
     const num_lanes = 4;
     const io = std.testing.io;
 
-    const Shared = struct {
-        data: [num_lanes]u32 = @splat(0),
-        ok: std.atomic.Value(u32) = .init(0),
-    };
-    var shared: Shared = .{};
+    var data: [num_lanes]u32 = @splat(0);
     var barrier: Barrier = .{ .expected = num_lanes };
-    var slot: Lane.BroadcastSlot = .{};
+    var slot: BroadcastSlot = .{};
 
     const Worker = struct {
-        fn run(s: *Shared, b: *Barrier, slot_: *Lane.BroadcastSlot, io_: std.Io, idx: u32) anyerror!void {
-            var lane: Lane = .{
-                .index = idx,
-                .count = num_lanes,
-                .broadcast_slot = slot_,
-                .barrier = b,
-            };
-            s.data[idx] = idx + 1;
-            try lane.sync(io_);
+        fn run(lane: Lane, d: *[num_lanes]u32, io_: std.Io) anyerror!void {
+            var l = lane;
+            d[l.index] = l.index + 1;
+            try l.sync(io_);
             // after sync, every lane sees every other lane's write
-            for (s.data, 0..) |v, i| {
-                if (v == i + 1) _ = s.ok.fetchAdd(1, .monotonic);
-            }
+            try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4 }, d);
         }
     };
 
     var futures: [num_lanes]std.Io.Future(anyerror!void) = undefined;
     for (&futures, 0..) |*f, i| {
-        f.* = try io.concurrent(Worker.run, .{ &shared, &barrier, &slot, io, @as(u32, @intCast(i)) });
+        const lane: Lane = .{
+            .index = @intCast(i),
+            .count = num_lanes,
+            .broadcast_slot = &slot,
+            .barrier = &barrier,
+        };
+        f.* = try io.concurrent(Worker.run, .{ lane, &data, io });
     }
     for (&futures) |*f| try f.await(io);
-
-    try std.testing.expectEqual(@as(u32, num_lanes * num_lanes), shared.ok.load(.monotonic));
 }
 
 pub fn broadcast(
@@ -173,6 +166,34 @@ pub fn broadcast(
     // don't let the source lane reuse broadcast memory until everyone has read it
     try lane.barrier.wait(io);
 }
+
+test broadcast {
+    const num_lanes = 4;
+    const io = std.testing.io;
+
+    var barrier: Barrier = .{ .expected = num_lanes };
+    var slot: BroadcastSlot = .{};
+
+    const Worker = struct {
+        fn run(lane: Lane, io_: std.Io) anyerror!void {
+            var l = lane;
+            // two rounds with different sources, to check the slot can be reused
+            for ([_]u32{ 0, num_lanes - 1 }) |source| {
+                var value: u32 = if (l.index == source) 100 + source else 0;
+                try l.broadcast(u32, &value, source, io_);
+                try std.testing.expectEqual(100 + source, value);
+            }
+        }
+    };
+
+    var futures: [num_lanes]std.Io.Future(anyerror!void) = undefined;
+    for (&futures, 0..) |*f, i| {
+        const lane: Lane = .{ .index = @intCast(i), .count = num_lanes, .broadcast_slot = &slot, .barrier = &barrier };
+        f.* = try io.concurrent(Worker.run, .{ lane, io });
+    }
+    for (&futures) |*f| try f.await(io);
+}
+
 pub const Range = struct {
     start: usize,
     end: usize,
