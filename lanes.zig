@@ -46,11 +46,18 @@ pub const ThreadContext = struct {
 };
 
 pub const Lane = struct {
-    index: u32 = 0,
-    count: u32 = 1,
+    index: u32,
+    count: u32,
     /// slice of memory shared by all lanes
     broadcast_memory: *[std.atomic.cache_line]u8,
     barrier: *Barrier,
+
+    const single: Lane = .{
+        .index = 0,
+        .count = 1,
+        .broadcast_memory = @ptrFromInt(0), // unused
+        .barrier = @ptrFromInt(0), // unused
+    };
 
     pub fn isLeader(lane: Lane) bool {
         return lane.index == 0;
@@ -75,17 +82,17 @@ pub const Lane = struct {
     test range {
         for (1..32) |lane_count| {
             for (0..20) |n_bits| {
-                const n = 1 << n_bits;
+                const n: usize = @as(usize, 1) << @intCast(n_bits);
 
                 var lane: Lane = undefined;
                 lane.index = 0;
-                lane.count = lane_count;
+                lane.count = @intCast(lane_count);
                 var range_res = lane.range(n);
                 var min_len = range_res.len();
                 var max_len = range_res.len();
                 var end_prev = range_res.end;
                 for (1..lane_count) |lane_idx| {
-                    lane.index = lane_idx;
+                    lane.index = @intCast(lane_idx);
                     range_res = lane.range(n);
 
                     // expect: evenly distributed
@@ -105,13 +112,13 @@ pub const Lane = struct {
     /// Poison the lane group so every lane blocked in (or later entering) `sync`/`broadcast`
     /// returns `err`.  Intended to be called by whoever owns the lane's body when it fails.
     pub fn abort(lane: *Lane, io: std.Io, err: anyerror) void {
-        if (lane.* == .single) return;
+        if (lane.isSingle()) return;
         lane.barrier.abort(io, err);
     }
 
     pub fn sync(lane: *Lane, io: std.Io) anyerror!void {
         // single lane case
-        if (lane.* == .single) return;
+        if (lane.isSingle()) return;
         try lane.barrier.wait(io);
     }
 
@@ -168,7 +175,7 @@ pub const Lane = struct {
         }
 
         // single lane case
-        if (lane.* == .single) return;
+        if (lane.isSingle()) return;
 
         // copy to broadcast memory on source lane
         const len = @sizeOf(T);
