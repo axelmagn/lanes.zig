@@ -5,21 +5,18 @@ const assert = std.debug.assert;
 
 const ThreadContext = @This();
 
-initialized: bool = false,
-io: std.Io,
 lane: Lane = .single,
-
+io: ?std.Io,
 /// thread-safe general allocator
-safe_gpa: std.mem.Allocator,
+safe_gpa: ?std.mem.Allocator,
 /// thread-local scratch arena
-arena: std.heap.ArenaAllocator,
+arena: ?std.heap.ArenaAllocator,
 
 const uninitialized: ThreadContext = .{
-    .initialized = false,
-    .io = undefined,
-    .safe_gpa = undefined,
-    .arena = undefined,
     .lane = .single,
+    .io = null,
+    .safe_gpa = null,
+    .arena = null,
 };
 
 /// set the lane, returning previous lane (for nesting purposes)

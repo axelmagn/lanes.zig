@@ -13,42 +13,6 @@ aborted: std.atomic.Value(bool) = .init(false),
 
 pub const Error = error{aborted};
 
-pub fn abort(barrier: *Barrier, io: std.Io) void {
-    _ = barrier.aborted.store(true, .release);
-    // Change the futex word so a waiter that checked `abort` just before this can't go to sleep.
-    _ = barrier.generation.fetchAdd(1, .seq_cst);
-    io.futexWake(u32, &barrier.generation.raw, std.math.maxInt(u32));
-}
-
-test abort {
-    const num_lanes = 4;
-    const io = std.testing.io;
-
-    // spin_limit = 0 forces waiters down the futex path
-    var barrier: Barrier = .{ .expected = num_lanes, .spin_limit = 0 };
-
-    const Worker = struct {
-        fn run(b: *Barrier, io_: std.Io, idx: u32) anyerror!void {
-            if (idx == 0) {
-                // aborting lane never reaches the barrier
-                b.abort(io_);
-                return error.TestAbort;
-            }
-            try b.wait(io_);
-        }
-    };
-
-    var futures: [num_lanes]std.Io.Future(anyerror!void) = undefined;
-    for (&futures, 0..) |*f, i| {
-        f.* = try io.concurrent(Worker.run, .{ &barrier, io, @as(u32, @intCast(i)) });
-    }
-    // the aborting lane returns its own error; waiters only learn that the barrier was aborted
-    try std.testing.expectError(error.TestAbort, futures[0].await(io));
-    for (futures[1..]) |*f| try std.testing.expectError(error.aborted, f.await(io));
-
-    // sticky: later waits fail immediately
-    try std.testing.expectError(error.aborted, barrier.wait(io));
-}
 
 pub fn check(barrier: *Barrier) Error!void {
     if (barrier.aborted.load(.acquire)) return error.aborted;
@@ -125,4 +89,41 @@ test wait {
     try std.testing.expect(!shared.failed.load(.monotonic));
     try std.testing.expectEqual(rounds, shared.barrier.generation.load(.monotonic));
     try std.testing.expectEqual(@as(u32, 0), shared.barrier.arrived.load(.monotonic));
+}
+
+pub fn abort(barrier: *Barrier, io: std.Io) void {
+    _ = barrier.aborted.store(true, .release);
+    // Change the futex word so a waiter that checked `abort` just before this can't go to sleep.
+    _ = barrier.generation.fetchAdd(1, .seq_cst);
+    io.futexWake(u32, &barrier.generation.raw, std.math.maxInt(u32));
+}
+
+test abort {
+    const num_lanes = 4;
+    const io = std.testing.io;
+
+    // spin_limit = 0 forces waiters down the futex path
+    var barrier: Barrier = .{ .expected = num_lanes, .spin_limit = 0 };
+
+    const Worker = struct {
+        fn run(b: *Barrier, io_: std.Io, idx: u32) anyerror!void {
+            if (idx == 0) {
+                // aborting lane never reaches the barrier
+                b.abort(io_);
+                return error.TestAbort;
+            }
+            try b.wait(io_);
+        }
+    };
+
+    var futures: [num_lanes]std.Io.Future(anyerror!void) = undefined;
+    for (&futures, 0..) |*f, i| {
+        f.* = try io.concurrent(Worker.run, .{ &barrier, io, @as(u32, @intCast(i)) });
+    }
+    // the aborting lane returns its own error; waiters only learn that the barrier was aborted
+    try std.testing.expectError(error.TestAbort, futures[0].await(io));
+    for (futures[1..]) |*f| try std.testing.expectError(error.aborted, f.await(io));
+
+    // sticky: later waits fail immediately
+    try std.testing.expectError(error.aborted, barrier.wait(io));
 }

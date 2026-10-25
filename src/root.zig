@@ -11,14 +11,16 @@ threadlocal var thread_context: ThreadContext = .uninitialized;
 pub const Error = error{
     uninitialized,
     zero_lanes,
-} || Barrier.Error || std.Thread.CpuCountError;
+} || Lane.Error;
 
 pub const LaunchOptions = struct {
-    lanes: LanesMode = .cpus,
+    lanes: LanesMode = .max_cpus,
 
+    // TODO: more granular modes for performance cores, etc
     pub const LanesMode = union(enum) {
-        cpus,
+        max_cpus,
         exact: u32,
+        up_to: u32,
     };
 };
 
@@ -32,21 +34,28 @@ pub fn init(safe_gpa: std.mem.Allocator, threaded_io: *std.Io.Threaded) void {
     };
 }
 
+/// launch a function across multiple lanes.
+/// Returns a slice containing function results for each lane, allocated from thread arena.
 pub fn launch(
-    function: anytype,
-    args: ArgsTuple(@TypeOf(function)),
+    comptime function: anytype,
+    comptime args: ArgsTuple(@TypeOf(function)),
     opts: LaunchOptions,
-) LaunchReturn(@TypeOf(function)) {
+) LaunchError(function)![]FuncReturn(function) {
+    // I wish there was a better way to inspect CPUs and get just the performance ones
     const lanes = switch (opts.lanes) {
         .exact => |n| n,
-        .cpus => try std.Thread.getCpuCount(),
+        .max_cpus => try std.Thread.getCpuCount(),
+        .up_to => |n| @min(n, try std.Thread.getCpuCount()),
     };
     if (lanes == 0) return Error.zero_lanes;
-
     const barrier: Barrier = .{ .expected = lanes };
     const slot: Lane.BroadcastSlot = .{};
 
-    var futures: [lanes - 1]std.Io.Future(anyerror!void) = undefined;
+    const arena = try getArena();
+    defer arena.deinit();
+    const Future = std.Io.Future(FuncReturn(function));
+    var futures: []Future = try arena.allocator().alloc(Future, lanes - 1);
+
     var lane: Lane = .{
         .index = undefined,
         .count = lanes,
@@ -56,30 +65,62 @@ pub fn launch(
     const io = try getIo();
     for (&futures, 1..) |*f, i| {
         lane.index = @intCast(i);
-        f.* = try io.concurrent(runOnLane, .{ lane, function, args });
+        f.* = try io.concurrent(runOnLane, .{ function, args, lane, thread_context });
     }
+
+    const results = try arena.allocator().alloc(FuncReturn(function), lanes);
     lane.index = 0;
-    runOnLane(lane, function, args);
-    for (&futures) |*f| try f.await(io);
+    results[0] = runOnLane(function, args, lane, thread_context);
+    for (&futures, 1..) |f, i| {
+        results[i] = f.await(io);
+    }
+    for (results) |res| {
+        // if there was an error, there will be some superfluous aborts.
+        // Return the first error that is not an abort.
+        res catch |err| switch (err) {
+            Error.aborted => {},
+            else => return err,
+        };
+    }
+    return results;
 }
 
-fn LaunchReturn(T: type) type {
-    return @typeInfo(T).@"fn".return_type.?;
+pub fn LaunchError(comptime function: anytype) type {
+    return Error ||
+        FuncErrors(function) ||
+        std.Thread.CpuCountError ||
+        std.Io.ConcurrentError ||
+        error{OutOfMemory};
 }
 
-fn runOnLane(
+fn FuncErrors(comptime function: anytype) type {
+    const f_return = @typeInfo(@TypeOf(function)).@"fn".return_type.?;
+    const f_return_info = @typeInfo(f_return);
+    return switch (f_return_info) {
+        .error_set => |es| es,
+        .error_union => |eu| eu.error_set,
+        else => error{},
+    };
+}
+
+fn FuncReturn(comptime function: anytype) type {
+    return @typeInfo(@TypeOf(function)).@"fn".return_type.?;
+}
+
+pub fn runOnLane(
+    comptime function: anytype,
+    comptime args: ArgsTuple(@TypeOf(function)),
     lane: Lane,
-    function: anytype,
-    args: ArgsTuple(@TypeOf(function)),
-) RunReturn(@TypeOf(function)) {
-    const prev_lane = thread_context.lane;
-    defer thread_context.lane = prev_lane;
+    src_thread_context: ThreadContext,
+) FuncReturn(function) {
+    try expectInitialized(src_thread_context);
+    const prev_tctx = thread_context;
+    defer thread_context = prev_tctx;
+    thread_context = src_thread_context;
+    thread_context.arena = std.heap.ArenaAllocator(thread_context.safe_gpa);
+    defer thread_context.arena.deinit();
     thread_context.lane = lane;
     return @call(.auto, function, args);
-}
-
-fn RunReturn(T: type) type {
-    return @typeInfo(T).@"fn".return_type.?;
 }
 
 pub fn sync() anyerror!void {
@@ -111,20 +152,17 @@ pub fn isSingle() bool {
 }
 
 pub fn getIo() Error!std.Io {
-    try expectInitialized();
-    return thread_context.io;
+    return if (thread_context.io) |io| io else Error.uninitialized;
 }
 
 pub fn getGpa() Error!std.mem.Allocator {
-    try expectInitialized();
-    return thread_context.safe_gpa;
+    return if (thread_context.safe_gpa) |gpa| gpa else Error.uninitialized;
 }
 
-pub fn getScratch() Error!*std.heap.ArenaAllocator {
-    try expectInitialized();
-    return &thread_context.arena;
+pub fn getArena() Error!*std.heap.ArenaAllocator {
+    return if (thread_context.arena == null) Error.uninitialized else &thread_context.arena.?;
 }
 
-fn expectInitialized() Error!void {
-    if (!thread_context.initialized) return Error.uninitialized;
+fn expectInitialized(tctx: ThreadContext) Error!void {
+    if (!tctx.initialized) return Error.uninitialized;
 }
