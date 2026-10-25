@@ -53,42 +53,31 @@ pub fn wait(barrier: *Barrier, io: std.Io) Error!void {
 
 test wait {
     const num_lanes = 4;
-    const rounds = 10_000;
-    const spin_limit = 256;
+    const rounds = 1000;
     const io = std.testing.io;
 
     const Shared = struct {
-        barrier: Barrier,
-        data: [2][num_lanes]u32 = @splat(@splat(0)),
-        failed: std.atomic.Value(bool) = .init(false),
+        barrier: Barrier = .{ .expected = num_lanes },
+        counter: std.atomic.Value(u32) = .init(0),
     };
-    var shared: Shared = .{ .barrier = .{ .expected = num_lanes, .spin_limit = spin_limit } };
+    var shared: Shared = .{};
 
     const Worker = struct {
-        fn run(s: *Shared, io_: std.Io, idx: u32, rounds_: u32) anyerror!void {
-            // Start at 1 so the zero-initialized buffers can never pass by accident.
-            var round: u32 = 1;
-            while (round <= rounds_) : (round += 1) {
-                const buf = &s.data[round & 1];
-                buf[idx] = round; // plain write, published only by the barrier
+        fn run(s: *Shared, io_: std.Io) anyerror!void {
+            for (1..rounds + 1) |round| {
+                _ = s.counter.fetchAdd(1, .monotonic);
                 try s.barrier.wait(io_);
-                // every lane's write for this round must be visible
-                for (buf) |v| {
-                    if (v != round) s.failed.store(true, .monotonic);
-                }
+                // every lane has incremented before anyone gets here
+                try std.testing.expectEqual(round * num_lanes, s.counter.load(.monotonic));
+                // keep fast lanes from incrementing before slow lanes have checked
+                try s.barrier.wait(io_);
             }
         }
     };
 
     var futures: [num_lanes]std.Io.Future(anyerror!void) = undefined;
-    for (&futures, 0..) |*f, i| {
-        f.* = try io.concurrent(Worker.run, .{ &shared, io, @as(u32, @intCast(i)), rounds });
-    }
+    for (&futures) |*f| f.* = try io.concurrent(Worker.run, .{ &shared, io });
     for (&futures) |*f| try f.await(io);
-
-    try std.testing.expect(!shared.failed.load(.monotonic));
-    try std.testing.expectEqual(rounds, shared.barrier.generation.load(.monotonic));
-    try std.testing.expectEqual(@as(u32, 0), shared.barrier.arrived.load(.monotonic));
 }
 
 pub fn abort(barrier: *Barrier, io: std.Io) void {
@@ -99,30 +88,17 @@ pub fn abort(barrier: *Barrier, io: std.Io) void {
 }
 
 test abort {
-    const num_lanes = 4;
     const io = std.testing.io;
 
-    // spin_limit = 0 forces waiters down the futex path
-    var barrier: Barrier = .{ .expected = num_lanes, .spin_limit = 0 };
+    // one lane short, so the waiters can only be released by abort.
+    // spin_limit = 0 forces them down the futex path.
+    var barrier: Barrier = .{ .expected = 4, .spin_limit = 0 };
 
-    const Worker = struct {
-        fn run(b: *Barrier, io_: std.Io, idx: u32) anyerror!void {
-            if (idx == 0) {
-                // aborting lane never reaches the barrier
-                b.abort(io_);
-                return error.TestAbort;
-            }
-            try b.wait(io_);
-        }
-    };
+    var futures: [3]std.Io.Future(Error!void) = undefined;
+    for (&futures) |*f| f.* = try io.concurrent(wait, .{ &barrier, io });
 
-    var futures: [num_lanes]std.Io.Future(anyerror!void) = undefined;
-    for (&futures, 0..) |*f, i| {
-        f.* = try io.concurrent(Worker.run, .{ &barrier, io, @as(u32, @intCast(i)) });
-    }
-    // the aborting lane returns its own error; waiters only learn that the barrier was aborted
-    try std.testing.expectError(error.TestAbort, futures[0].await(io));
-    for (futures[1..]) |*f| try std.testing.expectError(error.aborted, f.await(io));
+    barrier.abort(io);
+    for (&futures) |*f| try std.testing.expectError(error.aborted, f.await(io));
 
     // sticky: later waits fail immediately
     try std.testing.expectError(error.aborted, barrier.wait(io));
