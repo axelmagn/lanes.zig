@@ -18,8 +18,16 @@ pub const ThreadContext = struct {
         gpa.destroy(tctx);
     }
 
-    pub fn select(tctx: *ThreadContext) void {
+    /// make this the calling thread's context, returning the previous one so it can be restored
+    pub fn select(tctx: *ThreadContext) ?*ThreadContext {
+        const prev = thread_context_local;
         thread_context_local = tctx;
+        return prev;
+    }
+
+    /// undo a `select`
+    pub fn restore(prev: ?*ThreadContext) void {
+        thread_context_local = prev;
     }
 
     pub fn selected() Error!*ThreadContext {
@@ -37,27 +45,74 @@ pub const ThreadContext = struct {
     }
 };
 
-pub const Lane = union(enum) {
-    single,
-    grouped: struct {
-        index: u32,
-        count: u32,
-        /// slice of memory shared by all lanes
-        broadcast_memory: *[std.atomic.cache_line]u8,
-        barrier: *Barrier,
-    },
+pub const Lane = struct {
+    index: u32 = 0,
+    count: u32 = 1,
+    /// slice of memory shared by all lanes
+    broadcast_memory: *[std.atomic.cache_line]u8,
+    barrier: *Barrier,
+
+    pub fn isLeader(lane: Lane) bool {
+        return lane.index == 0;
+    }
+
+    pub fn isSingle(lane: Lane) bool {
+        return lane.count == 1;
+    }
+
+    /// This lane's share of `n` items.  Items are split evenly, with the remainder spread one
+    /// each over the first `n % count` lanes.
+    pub fn range(lane: Lane, n: usize) Range {
+        const c: usize = lane.count;
+        const i: usize = lane.index;
+        const base = n / c;
+        const rem = n % c;
+        const start = i * base + @min(i, rem);
+        const len = base + @intFromBool(i < rem);
+        return .{ .start = start, .end = start + len };
+    }
+
+    test range {
+        for (1..32) |lane_count| {
+            for (0..20) |n_bits| {
+                const n = 1 << n_bits;
+
+                var lane: Lane = undefined;
+                lane.index = 0;
+                lane.count = lane_count;
+                var range_res = lane.range(n);
+                var min_len = range_res.len();
+                var max_len = range_res.len();
+                var end_prev = range_res.end;
+                for (1..lane_count) |lane_idx| {
+                    lane.index = lane_idx;
+                    range_res = lane.range(n);
+
+                    // expect: evenly distributed
+                    min_len = @min(min_len, range_res.len());
+                    max_len = @min(max_len, range_res.len());
+                    try std.testing.expect(max_len - min_len < 2);
+
+                    // expect: sequential
+                    try std.testing.expectEqual(end_prev, range_res.start);
+                    end_prev = range_res.end;
+                }
+                try std.testing.expectEqual(n, end_prev);
+            }
+        }
+    }
 
     /// Poison the lane group so every lane blocked in (or later entering) `sync`/`broadcast`
     /// returns `err`.  Intended to be called by whoever owns the lane's body when it fails.
     pub fn abort(lane: *Lane, io: std.Io, err: anyerror) void {
         if (lane.* == .single) return;
-        lane.grouped.barrier.abort(io, err);
+        lane.barrier.abort(io, err);
     }
 
     pub fn sync(lane: *Lane, io: std.Io) anyerror!void {
         // single lane case
         if (lane.* == .single) return;
-        try lane.grouped.barrier.wait(io);
+        try lane.barrier.wait(io);
     }
 
     test sync {
@@ -74,12 +129,12 @@ pub const Lane = union(enum) {
 
         const Worker = struct {
             fn run(s: *Shared, b: *Barrier, mem: *[std.atomic.cache_line]u8, io_: std.Io, idx: u32) anyerror!void {
-                var lane: Lane = .{ .grouped = .{
+                var lane: Lane = .{
                     .index = idx,
                     .count = num_lanes,
                     .broadcast_memory = mem,
                     .barrier = b,
-                } };
+                };
                 s.data[idx] = idx + 1;
                 try lane.sync(io_);
                 // after sync, every lane sees every other lane's write
@@ -117,19 +172,19 @@ pub const Lane = union(enum) {
 
         // copy to broadcast memory on source lane
         const len = @sizeOf(T);
-        if (src_lane_idx == lane.grouped.index) {
+        if (src_lane_idx == lane.index) {
             const src: []u8 = std.mem.asBytes(broadcast_ptr);
-            const dst: []u8 = lane.grouped.broadcast_memory[0..len];
+            const dst: []u8 = lane.broadcast_memory[0..len];
             std.debug.assert(src.len == len);
             std.debug.assert(dst.len == len);
             @memcpy(dst, src);
         }
 
-        try lane.grouped.barrier.wait(io);
+        try lane.barrier.wait(io);
 
         // copy from broadcast memory on destination lanes
-        if (src_lane_idx != lane.grouped.index) {
-            const src: []u8 = lane.grouped.broadcast_memory[0..len];
+        if (src_lane_idx != lane.index) {
+            const src: []u8 = lane.broadcast_memory[0..len];
             const dst: []u8 = std.mem.asBytes(broadcast_ptr);
             std.debug.assert(src.len == len);
             std.debug.assert(dst.len == len);
@@ -137,7 +192,7 @@ pub const Lane = union(enum) {
         }
 
         // don't let the source lane reuse broadcast memory until everyone has read it
-        try lane.grouped.barrier.wait(io);
+        try lane.barrier.wait(io);
     }
 
     test broadcast {
@@ -153,13 +208,19 @@ pub const Lane = union(enum) {
         var memory: [std.atomic.cache_line]u8 align(std.atomic.cache_line) = undefined;
 
         const Worker = struct {
-            fn run(s: *Shared, b: *Barrier, mem: *[std.atomic.cache_line]u8, io_: std.Io, idx: u32) anyerror!void {
-                var lane: Lane = .{ .grouped = .{
+            fn run(
+                s: *Shared,
+                b: *Barrier,
+                mem: *[std.atomic.cache_line]u8,
+                io_: std.Io,
+                idx: u32,
+            ) anyerror!void {
+                var lane: Lane = .{
                     .index = idx,
                     .count = num_lanes,
                     .broadcast_memory = mem,
                     .barrier = b,
-                } };
+                };
                 // only the source lane starts with the real value
                 var value: u64 = if (idx == src_lane) 0xBEEF else 0;
                 try lane.broadcast(u64, &value, src_lane, io_);
@@ -169,7 +230,10 @@ pub const Lane = union(enum) {
 
         var futures: [num_lanes]std.Io.Future(anyerror!void) = undefined;
         for (&futures, 0..) |*f, i| {
-            f.* = try io.concurrent(Worker.run, .{ &shared, &barrier, &memory, io, @as(u32, @intCast(i)) });
+            f.* = try io.concurrent(
+                Worker.run,
+                .{ &shared, &barrier, &memory, io, @as(u32, @intCast(i)) },
+            );
         }
         for (&futures) |*f| try f.await(io);
 
@@ -304,7 +368,14 @@ pub const Barrier = struct {
     }
 };
 
-pub const Range = struct { start: usize, end: usize };
+pub const Range = struct {
+    start: usize,
+    end: usize,
+
+    pub fn len(r: Range) usize {
+        return r.end - r.start;
+    }
+};
 
 pub const Error = error{
     uninitialized,
