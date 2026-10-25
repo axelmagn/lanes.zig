@@ -211,9 +211,9 @@ const Lane = struct {
 
     /// Poison the lane group so every lane blocked in (or later entering) `sync`/`broadcast`
     /// returns `err`.  Intended to be called by whoever owns the lane's body when it fails.
-    fn abort(lane: *Lane, io: std.Io, err: anyerror) void {
+    fn abort(lane: *Lane, io: std.Io) void {
         if (lane.isSingle()) return;
-        lane.barrier.abort(io, err);
+        lane.barrier.abort(io);
     }
 
     fn sync(lane: *Lane, io: std.Io) anyerror!void {
@@ -316,7 +316,6 @@ const Barrier = struct {
     const Error = error{aborted};
 
     fn abort(barrier: *Barrier, io: std.Io) void {
-        // TODO: is this the right function to call?
         _ = barrier.aborted.store(true, .release);
         // Change the futex word so a waiter that checked `abort` just before this can't go to sleep.
         _ = barrier.generation.fetchAdd(1, .seq_cst);
