@@ -1,13 +1,34 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const cache_line = std.atomic.cache_line;
+const ArgsTuple = std.meta.ArgsTuple;
 
 threadlocal var thread_context: ThreadContext = .uninitialized;
 
-pub fn init(safe_gpa: std.mem.Allocator, io: std.Io) void {
+pub fn init(safe_gpa: std.mem.Allocator, threaded_io: *std.Io.Threaded) void {
     const arena = std.heap.ArenaAllocator.init(safe_gpa);
-    thread_context = .{ .initialized = true, .safe_gpa = safe_gpa, .io = io, .arena = arena };
+    thread_context = .{
+        .initialized = true,
+        .safe_gpa = safe_gpa,
+        .io = threaded_io.io(),
+        .arena = arena,
+    };
 }
+
+pub const LaunchOptions = struct {
+    pub const LanesMode = union(enum) {
+        exact: u32,
+        cpus,
+    };
+};
+
+// pub fn launch(
+//     function: anytype,
+//     args: ArgsTuple(@TypeOf(function)),
+//     opts: LaunchOptions,
+// ) ReturnType(@TypeOf(function)) {
+//
+// }
 
 pub fn getIndex() u32 {
     return thread_context.lane.index;
@@ -25,18 +46,17 @@ pub fn isSingle() bool {
     return thread_context.lane.isSingle();
 }
 
-pub fn getIo() Error!std.Io {
+pub fn getIo() LanesError!std.Io {
     try expectInitialized();
     return thread_context.io;
 }
 
-pub fn getGpa() Error!std.mem.Allocator {
+pub fn getGpa() LanesError!std.mem.Allocator {
     try expectInitialized();
     return thread_context.safe_gpa;
-
 }
 
-pub fn getScratch() Error!std.heap.ArenaAllocator {
+pub fn getScratch() LanesError!std.heap.ArenaAllocator {
     try expectInitialized();
     return thread_context.arena;
 }
@@ -51,8 +71,24 @@ pub fn broadcast(T: type, broadcast_ptr: *T, source_lane_index: u32) anyerror!vo
     try thread_context.lane.broadcast(T, broadcast_ptr, source_lane_index, io);
 }
 
-fn expectInitialized() Error!void {
-    if (!thread_context.initialized) return Error.uninitialized;
+fn expectInitialized() LanesError!void {
+    if (!thread_context.initialized) return LanesError.uninitialized;
+}
+
+fn ReturnType(T: type) type {
+    return @typeInfo(T).@"fn".return_type.?;
+}
+
+fn LaunchResult(comptime F: type) type {
+    const R = @typeInfo(F).@"fn".return_type.?;
+    return switch (@typeInfo(R)) {
+        .void => LanesError!void,
+        .error_union => |eu| {
+            if (eu.payload != void) @compileError("lane functions must return void or E!void");
+            return (eu.error_set || LanesError)!void;
+        },
+        else => @compileError("lane functions must return void or E!void"),
+    };
 }
 
 pub const Range = struct {
@@ -64,9 +100,9 @@ pub const Range = struct {
     }
 };
 
-pub const Error = error{
+pub const LanesError = error{
     uninitialized,
-};
+} || Barrier.Error;
 
 const ThreadContext = struct {
     initialized: bool = false,
@@ -274,24 +310,24 @@ const Barrier = struct {
     arrived: std.atomic.Value(u32) = .init(0),
     sleepers: std.atomic.Value(u32) = .init(0),
     generation: std.atomic.Value(u32) = .init(0),
-    /// `@intFromError` of the first error passed to `abort`, or 0 if not aborted.  Sticky.
-    err: std.atomic.Value(u16) = .init(0),
+    /// Set by `abort`.  Sticky.
+    aborted: std.atomic.Value(bool) = .init(false),
 
-    /// Poison the barrier: wake every waiter and make all current and future `wait`s return `e`.
-    /// The first error wins.
-    fn abort(barrier: *Barrier, io: std.Io, e: anyerror) void {
-        _ = barrier.err.cmpxchgStrong(0, @intFromError(e), .release, .monotonic);
-        // Change the futex word so a waiter that checked `err` just before this can't go to sleep.
+    const Error = error{aborted};
+
+    fn abort(barrier: *Barrier, io: std.Io) void {
+        // TODO: is this the right function to call?
+        _ = barrier.aborted.store(true, .release);
+        // Change the futex word so a waiter that checked `abort` just before this can't go to sleep.
         _ = barrier.generation.fetchAdd(1, .seq_cst);
         io.futexWake(u32, &barrier.generation.raw, std.math.maxInt(u32));
     }
 
-    fn check(barrier: *Barrier) anyerror!void {
-        const code = barrier.err.load(.acquire);
-        if (code != 0) return @errorFromInt(code);
+    fn check(barrier: *Barrier) Error!void {
+        if (barrier.aborted.load(.acquire)) return error.aborted;
     }
 
-    fn wait(barrier: *Barrier, io: std.Io) anyerror!void {
+    fn wait(barrier: *Barrier, io: std.Io) Error!void {
         // fail fast: an aborted barrier will never fill
         try barrier.check();
 
@@ -375,7 +411,7 @@ const Barrier = struct {
             fn run(b: *Barrier, io_: std.Io, idx: u32) anyerror!void {
                 if (idx == 0) {
                     // aborting lane never reaches the barrier
-                    b.abort(io_, error.TestAbort);
+                    b.abort(io_);
                     return error.TestAbort;
                 }
                 try b.wait(io_);
@@ -386,11 +422,12 @@ const Barrier = struct {
         for (&futures, 0..) |*f, i| {
             f.* = try io.concurrent(Worker.run, .{ &barrier, io, @as(u32, @intCast(i)) });
         }
-        // every lane, aborter and waiters alike, reports the same error
-        for (&futures) |*f| try std.testing.expectError(error.TestAbort, f.await(io));
+        // the aborting lane returns its own error; waiters only learn that the barrier was aborted
+        try std.testing.expectError(error.TestAbort, futures[0].await(io));
+        for (futures[1..]) |*f| try std.testing.expectError(error.aborted, f.await(io));
 
         // sticky: later waits fail immediately
-        try std.testing.expectError(error.TestAbort, barrier.wait(io));
+        try std.testing.expectError(error.aborted, barrier.wait(io));
     }
 };
 
