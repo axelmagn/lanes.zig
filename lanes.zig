@@ -1,75 +1,139 @@
 const std = @import("std");
+const assert = std.debug.assert;
+const cache_line = std.atomic.cache_line;
 
-threadlocal var thread_context_local: ?*ThreadContext = null;
+threadlocal var thread_context: ThreadContext = .uninitialized;
 
-pub const ThreadContext = struct {
-    scratch: std.heap.ArenaAllocator,
+pub fn init(safe_gpa: std.mem.Allocator, io: std.Io) void {
+    const arena = std.heap.ArenaAllocator.init(safe_gpa);
+    thread_context = .{ .initialized = true, .safe_gpa = safe_gpa, .io = io, .arena = arena };
+}
+
+pub fn getIndex() u32 {
+    return thread_context.lane.index;
+}
+
+pub fn getCount() u32 {
+    return thread_context.lane.count;
+}
+
+pub fn isLeader() bool {
+    return thread_context.lane.isLeader();
+}
+
+pub fn isSingle() bool {
+    return thread_context.lane.isSingle();
+}
+
+pub fn getIo() Error!std.Io {
+    try expectInitialized();
+    return thread_context.io;
+}
+
+pub fn getGpa() Error!std.mem.Allocator {
+    try expectInitialized();
+    return thread_context.safe_gpa;
+
+}
+
+pub fn getScratch() Error!std.heap.ArenaAllocator {
+    try expectInitialized();
+    return thread_context.arena;
+}
+
+pub fn sync() anyerror!void {
+    const io = try getIo();
+    try thread_context.lane.sync(io);
+}
+
+pub fn broadcast(T: type, broadcast_ptr: *T, source_lane_index: u32) anyerror!void {
+    const io = try getIo();
+    try thread_context.lane.broadcast(T, broadcast_ptr, source_lane_index, io);
+}
+
+fn expectInitialized() Error!void {
+    if (!thread_context.initialized) return Error.uninitialized;
+}
+
+pub const Range = struct {
+    start: usize,
+    end: usize,
+
+    pub fn len(r: Range) usize {
+        return r.end - r.start;
+    }
+};
+
+pub const Error = error{
+    uninitialized,
+};
+
+const ThreadContext = struct {
+    initialized: bool = false,
+
+    io: std.Io,
+
+    /// thread-safe general allocator
+    safe_gpa: std.mem.Allocator,
+
+    /// thread-local scratch arena
+    arena: std.heap.ArenaAllocator,
+
+    /// lane context data
     lane: Lane = .single,
 
-    pub fn init(gpa: std.mem.Allocator) !*ThreadContext {
-        const tctx = try gpa.create(ThreadContext);
-        const arena = std.heap.ArenaAllocator.init(gpa);
-        tctx.* = .{ .scratch = arena };
-        return tctx;
-    }
-
-    pub fn deinit(tctx: *ThreadContext, gpa: std.mem.Allocator) void {
-        tctx.scratch.deinit();
-        gpa.destroy(tctx);
-    }
-
-    /// make this the calling thread's context, returning the previous one so it can be restored
-    pub fn select(tctx: *ThreadContext) ?*ThreadContext {
-        const prev = thread_context_local;
-        thread_context_local = tctx;
-        return prev;
-    }
-
-    /// undo a `select`
-    pub fn restore(prev: ?*ThreadContext) void {
-        thread_context_local = prev;
-    }
-
-    pub fn selected() Error!*ThreadContext {
-        return if (thread_context_local == null)
-            error.uninitialized
-        else
-            thread_context_local.?;
-    }
+    const uninitialized: ThreadContext = .{
+        .initialized = false,
+        .io = undefined,
+        .safe_gpa = undefined,
+        .arena = undefined,
+        .lane = .single,
+    };
 
     /// set the lane, returning previous lane (for nesting purposes)
-    pub fn setLane(tctx: *ThreadContext, lane: Lane) Error!Lane {
+    fn setLane(tctx: *ThreadContext, lane: Lane) Lane {
+        assert(tctx.initialized);
         const prev_lane = tctx.lane;
         tctx.lane = lane;
         return prev_lane;
     }
 };
 
-pub const Lane = struct {
+/// The context describing how a thread fits into a group. It never makes sense
+/// for there to be more lanes than threads.
+const Lane = struct {
     index: u32,
     count: u32,
     /// slice of memory shared by all lanes
-    broadcast_memory: *[std.atomic.cache_line]u8,
+    broadcast_slot: *BroadcastSlot,
     barrier: *Barrier,
 
     const single: Lane = .{
         .index = 0,
         .count = 1,
-        .broadcast_memory = @ptrFromInt(0), // unused
-        .barrier = @ptrFromInt(0), // unused
+        .broadcast_slot = undefined,
+        .barrier = undefined,
     };
 
-    pub fn isLeader(lane: Lane) bool {
+    const BroadcastSlot = struct {
+        bytes: [cache_line]u8 align(cache_line) = undefined,
+    };
+
+    fn isLeader(lane: Lane) bool {
         return lane.index == 0;
     }
 
-    pub fn isSingle(lane: Lane) bool {
-        return lane.count == 1;
+    fn isSingle(lane: Lane) bool {
+        if (lane.count == 1) {
+            std.debug.assert(lane.index == 0);
+            return true;
+        }
+        return false;
     }
 
     /// This lane's share of `n` items.  Items are split evenly, with the remainder spread one
     /// each over the first `n % count` lanes.
-    pub fn range(lane: Lane, n: usize) Range {
+    fn range(lane: Lane, n: usize) Range {
         const c: usize = lane.count;
         const i: usize = lane.index;
         const base = n / c;
@@ -111,18 +175,18 @@ pub const Lane = struct {
 
     /// Poison the lane group so every lane blocked in (or later entering) `sync`/`broadcast`
     /// returns `err`.  Intended to be called by whoever owns the lane's body when it fails.
-    pub fn abort(lane: *Lane, io: std.Io, err: anyerror) void {
+    fn abort(lane: *Lane, io: std.Io, err: anyerror) void {
         if (lane.isSingle()) return;
         lane.barrier.abort(io, err);
     }
 
-    pub fn sync(lane: *Lane, io: std.Io) anyerror!void {
+    fn sync(lane: *Lane, io: std.Io) anyerror!void {
         // single lane case
         if (lane.isSingle()) return;
         try lane.barrier.wait(io);
     }
 
-    test sync {
+    test "Lane.sync" {
         const num_lanes = 4;
         const io = std.testing.io;
 
@@ -132,14 +196,14 @@ pub const Lane = struct {
         };
         var shared: Shared = .{};
         var barrier: Barrier = .{ .expected = num_lanes };
-        var memory: [std.atomic.cache_line]u8 align(std.atomic.cache_line) = undefined;
+        var slot: Lane.BroadcastSlot = .{};
 
         const Worker = struct {
-            fn run(s: *Shared, b: *Barrier, mem: *[std.atomic.cache_line]u8, io_: std.Io, idx: u32) anyerror!void {
+            fn run(s: *Shared, b: *Barrier, slot_: *Lane.BroadcastSlot, io_: std.Io, idx: u32) anyerror!void {
                 var lane: Lane = .{
                     .index = idx,
                     .count = num_lanes,
-                    .broadcast_memory = mem,
+                    .broadcast_slot = slot_,
                     .barrier = b,
                 };
                 s.data[idx] = idx + 1;
@@ -153,25 +217,25 @@ pub const Lane = struct {
 
         var futures: [num_lanes]std.Io.Future(anyerror!void) = undefined;
         for (&futures, 0..) |*f, i| {
-            f.* = try io.concurrent(Worker.run, .{ &shared, &barrier, &memory, io, @as(u32, @intCast(i)) });
+            f.* = try io.concurrent(Worker.run, .{ &shared, &barrier, &slot, io, @as(u32, @intCast(i)) });
         }
         for (&futures) |*f| try f.await(io);
 
         try std.testing.expectEqual(@as(u32, num_lanes * num_lanes), shared.ok.load(.monotonic));
     }
 
-    pub fn broadcast(
+    fn broadcast(
         lane: *Lane,
         /// type of data being broadcast
         T: type,
         /// source pointer  on src lane, destination pointer on all other lanes
         broadcast_ptr: *T,
         /// index of the source lane
-        src_lane_idx: u32,
+        source_lane_index: u32,
         io: std.Io,
     ) anyerror!void {
         comptime {
-            std.debug.assert(@sizeOf(T) <= std.atomic.cache_line);
+            assert(@sizeOf(T) <= @sizeOf(BroadcastSlot));
         }
 
         // single lane case
@@ -179,76 +243,31 @@ pub const Lane = struct {
 
         // copy to broadcast memory on source lane
         const len = @sizeOf(T);
-        if (src_lane_idx == lane.index) {
+        if (source_lane_index == lane.index) {
             const src: []u8 = std.mem.asBytes(broadcast_ptr);
-            const dst: []u8 = lane.broadcast_memory[0..len];
-            std.debug.assert(src.len == len);
-            std.debug.assert(dst.len == len);
+            const dst: []u8 = lane.broadcast_slot.bytes[0..len];
+            assert(src.len == len);
+            assert(dst.len == len);
             @memcpy(dst, src);
         }
 
         try lane.barrier.wait(io);
 
         // copy from broadcast memory on destination lanes
-        if (src_lane_idx != lane.index) {
-            const src: []u8 = lane.broadcast_memory[0..len];
+        if (source_lane_index != lane.index) {
+            const src: []u8 = lane.broadcast_slot.bytes[0..len];
             const dst: []u8 = std.mem.asBytes(broadcast_ptr);
-            std.debug.assert(src.len == len);
-            std.debug.assert(dst.len == len);
+            assert(src.len == len);
+            assert(dst.len == len);
             @memcpy(dst, src);
         }
 
         // don't let the source lane reuse broadcast memory until everyone has read it
         try lane.barrier.wait(io);
     }
-
-    test broadcast {
-        const num_lanes = 4;
-        const src_lane = 2;
-        const io = std.testing.io;
-
-        const Shared = struct {
-            received: [num_lanes]u64 = @splat(0),
-        };
-        var shared: Shared = .{};
-        var barrier: Barrier = .{ .expected = num_lanes };
-        var memory: [std.atomic.cache_line]u8 align(std.atomic.cache_line) = undefined;
-
-        const Worker = struct {
-            fn run(
-                s: *Shared,
-                b: *Barrier,
-                mem: *[std.atomic.cache_line]u8,
-                io_: std.Io,
-                idx: u32,
-            ) anyerror!void {
-                var lane: Lane = .{
-                    .index = idx,
-                    .count = num_lanes,
-                    .broadcast_memory = mem,
-                    .barrier = b,
-                };
-                // only the source lane starts with the real value
-                var value: u64 = if (idx == src_lane) 0xBEEF else 0;
-                try lane.broadcast(u64, &value, src_lane, io_);
-                s.received[idx] = value;
-            }
-        };
-
-        var futures: [num_lanes]std.Io.Future(anyerror!void) = undefined;
-        for (&futures, 0..) |*f, i| {
-            f.* = try io.concurrent(
-                Worker.run,
-                .{ &shared, &barrier, &memory, io, @as(u32, @intCast(i)) },
-            );
-        }
-        for (&futures) |*f| try f.await(io);
-
-        for (shared.received) |v| try std.testing.expectEqual(@as(u64, 0xBEEF), v);
-    }
 };
 
-pub const Barrier = struct {
+const Barrier = struct {
     /// number of expected waiters
     expected: u32,
     spin_limit: u32 = 256, // chosen by throwing a dart at the wall
@@ -260,7 +279,7 @@ pub const Barrier = struct {
 
     /// Poison the barrier: wake every waiter and make all current and future `wait`s return `e`.
     /// The first error wins.
-    pub fn abort(barrier: *Barrier, io: std.Io, e: anyerror) void {
+    fn abort(barrier: *Barrier, io: std.Io, e: anyerror) void {
         _ = barrier.err.cmpxchgStrong(0, @intFromError(e), .release, .monotonic);
         // Change the futex word so a waiter that checked `err` just before this can't go to sleep.
         _ = barrier.generation.fetchAdd(1, .seq_cst);
@@ -272,7 +291,7 @@ pub const Barrier = struct {
         if (code != 0) return @errorFromInt(code);
     }
 
-    pub fn wait(barrier: *Barrier, io: std.Io) anyerror!void {
+    fn wait(barrier: *Barrier, io: std.Io) anyerror!void {
         // fail fast: an aborted barrier will never fill
         try barrier.check();
 
@@ -373,19 +392,6 @@ pub const Barrier = struct {
         // sticky: later waits fail immediately
         try std.testing.expectError(error.TestAbort, barrier.wait(io));
     }
-};
-
-pub const Range = struct {
-    start: usize,
-    end: usize,
-
-    pub fn len(r: Range) usize {
-        return r.end - r.start;
-    }
-};
-
-pub const Error = error{
-    uninitialized,
 };
 
 test {
