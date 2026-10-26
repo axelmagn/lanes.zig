@@ -37,7 +37,7 @@ pub fn init(safe_gpa: std.mem.Allocator, threaded_io: *std.Io.Threaded) void {
 /// Returns a slice containing function results for each lane, allocated from thread arena.
 pub fn launch(
     comptime function: anytype,
-    comptime args: ArgsTuple(@TypeOf(function)),
+    args: ArgsTuple(@TypeOf(function)),
     opts: LaunchOptions,
 ) LaunchError(function)![]FuncReturn(function) {
     // I wish there was a better way to inspect CPUs and get just the performance ones
@@ -51,9 +51,10 @@ pub fn launch(
     const slot: Lane.BroadcastSlot = .{};
 
     const arena = try getArena();
-    defer arena.deinit();
+    const results = try arena.allocator().alloc(FuncReturn(function), lanes);
     const Future = std.Io.Future(FuncReturn(function));
     var futures: []Future = try arena.allocator().alloc(Future, lanes - 1);
+    defer arena.allocator().free(futures);
 
     var lane: Lane = .{
         .index = undefined,
@@ -62,12 +63,24 @@ pub fn launch(
         .barrier = &barrier,
     };
     const io = try getIo();
+    var concurrent_err: ?std.Io.ConcurrentError = null;
+    var failed_idx: usize = 0;
     for (&futures, 1..) |*f, i| {
         lane.index = @intCast(i);
-        f.* = try io.concurrent(runOnLane, .{ function, args, lane, thread_context });
+        f.* = io.concurrent(runOnLane, .{ function, args, lane, thread_context }) catch |err| {
+            concurrent_err = err;
+            failed_idx = i;
+            break;
+        };
     }
 
-    const results = try arena.allocator().alloc(FuncReturn(function), lanes);
+    if (concurrent_err != null) {
+        for (futures, 0..failed_idx) |f, _| {
+            f.cancel(io);
+        }
+
+    }
+
     lane.index = 0;
     results[0] = runOnLane(function, args, lane, thread_context);
     for (&futures, 1..) |f, i| {
@@ -108,7 +121,7 @@ fn FuncReturn(comptime function: anytype) type {
 
 pub fn runOnLane(
     comptime function: anytype,
-    comptime args: ArgsTuple(@TypeOf(function)),
+    args: ArgsTuple(@TypeOf(function)),
     lane: Lane,
     src_thread_context: ThreadContext,
 ) FuncReturn(function) {
@@ -116,7 +129,7 @@ pub fn runOnLane(
     const prev_tctx = thread_context;
     defer thread_context = prev_tctx;
     thread_context = src_thread_context;
-    thread_context.arena = std.heap.ArenaAllocator(thread_context.safe_gpa);
+    thread_context.arena = std.heap.ArenaAllocator(try getGpa());
     defer thread_context.arena.deinit();
     thread_context.lane = lane;
     return @call(.auto, function, args);
