@@ -8,14 +8,14 @@ const ThreadContext = @This();
 lane: Lane = .single,
 io: ?std.Io,
 /// thread-safe general allocator
-safe_gpa: ?std.mem.Allocator,
+gpa: ?std.mem.Allocator,
 /// thread-local scratch arena
 arena: ?std.heap.ArenaAllocator,
 
 pub const uninitialized: ThreadContext = .{
     .lane = .single,
     .io = null,
-    .safe_gpa = null,
+    .gpa = null,
     .arena = null,
 };
 
