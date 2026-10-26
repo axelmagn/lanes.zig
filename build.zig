@@ -18,6 +18,7 @@ pub fn build(b: *std.Build) void {
     const examples = .{
         .{ .name = "sum", .step = "run-sum" },
         .{ .name = "radix_sort", .step = "run-radix-sort" },
+        .{ .name = "task_queue", .step = "run-task-queue" },
     };
     const examples_step = b.step("examples", "build all examples");
     inline for (examples) |example| {

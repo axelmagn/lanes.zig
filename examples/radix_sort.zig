@@ -1,3 +1,5 @@
+//! radix sort an array of random numbers in parallel
+
 const std = @import("std");
 const lanes = @import("lanes");
 const log = std.log.scoped(.example);
@@ -7,7 +9,39 @@ const radix_bits = 8;
 const buckets = 1 << radix_bits;
 const passes = @bitSizeOf(u64) / radix_bits;
 
-fn task(data: []u64) !void {
+pub fn main(init: std.process.Init) !void {
+    // set up lanes
+    const gpa = init.gpa;
+    const io = init.io;
+    lanes.init(gpa, io);
+    defer lanes.deinit();
+
+    // populate data
+    const n = 1 << 24;
+    const data = try gpa.alloc(u64, n);
+    defer gpa.free(data);
+    var prng = std.Random.DefaultPrng.init(42);
+    prng.random().bytes(std.mem.sliceAsBytes(data));
+
+    // launch
+    const lane_count: u32 = @intCast(try std.Thread.getCpuCount());
+    log.info("sorting {d} u64 keys", .{n});
+    const start = std.Io.Timestamp.now(io, .awake);
+    try lanes.launch(lane_count, kernel, .{data});
+    const end = std.Io.Timestamp.now(io, .awake);
+
+    // check result
+    log.info("checking result...", .{});
+    var x = data[0];
+    for (data[1..]) |y| {
+        std.debug.assert(x <= y);
+        x = y;
+    }
+    const ms = start.durationTo(end).toMilliseconds();
+    log.info("array successfully sorted in {d}ms", .{ms});
+}
+
+fn kernel(data: []u64) !void {
     // set up and broadcast shared data
     const Scratch = struct {
         /// ping pong partner of data
@@ -75,36 +109,4 @@ fn getBucket(value: u64, pass: usize) usize {
     const shr = pass * radix_bits;
     const mask = buckets - 1;
     return @intCast((value >> @intCast(shr)) & mask);
-}
-
-pub fn main(init: std.process.Init) !void {
-    // set up lanes
-    const gpa = init.gpa;
-    const io = init.io;
-    lanes.init(gpa, io);
-    defer lanes.deinit();
-
-    // populate data
-    const n = 1 << 24;
-    const data = try gpa.alloc(u64, n);
-    defer gpa.free(data);
-    var prng = std.Random.DefaultPrng.init(12345);
-    prng.random().bytes(std.mem.sliceAsBytes(data));
-
-    // launch
-    const lane_count: u32 = @intCast(try std.Thread.getCpuCount());
-    log.info("sorting {d} u64 keys", .{n});
-    const start = std.Io.Timestamp.now(io, .awake);
-    try lanes.launch(lane_count, task, .{data});
-    const end = std.Io.Timestamp.now(io, .awake);
-
-    // check result
-    log.info("checking result...", .{});
-    var x = data[0];
-    for (data[1..]) |y| {
-        std.debug.assert(x <= y);
-        x = y;
-    }
-    const ms = start.durationTo(end).toMilliseconds();
-    log.info("array successfully sorted in {d}ms", .{ms});
 }

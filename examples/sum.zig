@@ -1,12 +1,13 @@
-//! parallel sum
+//! calculate the sum of an array in parallel
 
 const std = @import("std");
 const lanes = @import("lanes");
 const log = std.log.scoped(.example);
 
+const n = 1 << 20;
+
 pub fn main(init: std.process.Init) !void {
     // populate data
-    const n = 10_000_000;
     const data = try init.gpa.alloc(u64, n);
     defer init.gpa.free(data);
     for (data, 0..) |*x, i| x.* = i;
@@ -17,13 +18,13 @@ pub fn main(init: std.process.Init) !void {
     const lane_count: u32 = @intCast(try std.Thread.getCpuCount());
 
     // Run task on every lane and wait for all of them to finish
-    try lanes.launch(lane_count, task, .{data});
+    try lanes.launch(lane_count, kernel, .{data});
 
     std.debug.print("expected = {d}\n", .{@as(u64, n) * (n - 1) / 2});
 }
 
 /// This runs once on every lane.
-fn task(data: []const u64) !void {
+fn kernel(data: []const u64) !void {
     // set up and broadcast communication buffer for partial sums
     var partials: []u64 = undefined;
     const lane_count: usize = @as(usize, lanes.getCount());
