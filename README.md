@@ -3,6 +3,17 @@
 A Zig parallelism library based on [Multi-Core by
 Default](https://www.dgtlgrove.com/p/multi-core-by-default) by Ryan Fleury.
 
+This library allows the user to write "CPU kernels" and manage them via thread
+lanes.  CPU kernels resemble GPU kernels in CUDA or shaders: they execute
+sequentially on multiple threads, coordinated by synchronization barriers and
+broadcasts.
+
+It exposes a simple, opinionated API mediated by thread-local static variables.
+
+Examples can be found in the `examples` directory, and can be built with `zig
+build examples`.
+
+
 ## Installation
 
 Fetch the dependency.
@@ -22,19 +33,7 @@ pub fn build(b: *std.Build) void {
 }
 ```
 
-## Library Overview
-
-
-This library allows the user to write "CPU kernels" and manage them via thread
-lanes.  CPU kernels resemble GPU kernels in CUDA or shaders: they execute
-sequentially on multiple threads, coordinated by synchronization barriers and
-broadcasts.
-
-It exposes a simple, opinionated API mediated by thread-local static variables.
-
-Examples can be found in the `examples` directory.
-
-### Example: Parallel Sum
+## Example: Parallel Sum
 
 This code uses all cores to calculate the sum of a data array.
 
