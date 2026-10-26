@@ -17,7 +17,6 @@ pub fn build(b: *std.Build) void {
 
     const examples = .{
         .{ .name = "sum", .step = "run-sum" },
-        .{ .name = "wordcount", .step = "run-wordcount" },
         .{ .name = "radix_sort", .step = "run-radix-sort" },
     };
     const examples_step = b.step("examples", "build all examples");
