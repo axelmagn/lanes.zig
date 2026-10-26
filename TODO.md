@@ -1,4 +1,4 @@
 # TODO
 
-- [ ] reconcile divergent local branches
-- [ ] add license
+- [x] reconcile divergent local branches
+- [x] add license
