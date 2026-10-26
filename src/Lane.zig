@@ -29,6 +29,7 @@ pub const Range = struct {
     start: usize,
     end: usize,
 
+    /// Number of items in the range.
     pub fn len(r: Range) usize {
         return r.end - r.start;
     }

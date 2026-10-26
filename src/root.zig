@@ -18,10 +18,13 @@ pub const SyncError = Error || Lane.Error;
 
 pub const Range = Lane.Range;
 
+/// Sets up the calling thread's context with `gpa` and `io`; must precede `launch`.
+/// Pair with `deinit`.
 pub fn init(gpa: std.mem.Allocator, io: std.Io) void {
     thread_context = .{ .gpa = gpa, .io = io, .arena = .init(gpa) };
 }
 
+/// Frees the calling thread's arena and returns its context to the uninitialized state.
 pub fn deinit() void {
     if (thread_context.arena) |*arena| arena.deinit();
     thread_context = .uninitialized;
@@ -42,12 +45,8 @@ fn FnErrorSet(comptime F: type) type {
     };
 }
 
-/// launch a function across `lanes` lanes, and wait for all of them to finish.
-/// The calling thread runs lane 0; the rest run on new threads.
-///
-/// `function` may return `void` or `E!void`.  If any lane returns an error, the lane group is
-/// aborted (lanes blocked in `sync`/`broadcast` get `error.aborted`) and `launch` returns the
-/// first error that was raised, once every lane has finished.
+/// Runs `function` on `lane_count` lanes (the caller is lane 0) and waits for all to finish.
+/// If a lane fails, the others are aborted and the first error raised is returned.
 pub fn launch(
     lane_count: usize,
     comptime function: anytype,
@@ -116,6 +115,7 @@ test launch {
     try std.testing.expectError(error.zero_lanes, launch(0, worker.run, .{ &counter, 0 }));
 }
 
+/// thread-local entrypoint for running a function on a lane
 fn runOnLane(
     lane: Lane,
     parent: ThreadContext,
@@ -150,6 +150,8 @@ fn runOnLane(
     };
 }
 
+/// Makes every other lane's pending or future `sync`/`broadcast` return `error.aborted`.
+/// Does nothing if the thread has no context.
 pub fn abort() void {
     // we can fail silently here: if there's no thread IO, there's no barrier
     // and no sync
@@ -172,10 +174,14 @@ test abort {
     try std.testing.expectError(error.aborted, launch(4, worker.run, .{}));
 }
 
+/// Blocks until every lane in the group has reached this call; all lanes must call it.
+/// Returns `error.aborted` if the group was aborted.
 pub fn sync() SyncError!void {
     try thread_context.lane.sync(try getIo());
 }
 
+/// Copies `*broadcast_ptr` from lane `source_lane_index` into the same pointer on all other lanes.
+/// Collective: every lane must call it, and `T` must fit in one cache line.
 pub fn broadcast(T: type, broadcast_ptr: *T, source_lane_index: usize) SyncError!void {
     try thread_context.lane.broadcast(T, broadcast_ptr, source_lane_index, try getIo());
 }
@@ -228,14 +234,17 @@ pub fn isSingle() bool {
     return thread_context.lane.isSingle();
 }
 
+/// the IO associated with this thread
 pub fn getIo() Error!std.Io {
     return if (thread_context.io) |io| io else Error.uninitialized;
 }
 
+/// the general purpose allocator associated with this thread
 pub fn getGpa() Error!std.mem.Allocator {
     return if (thread_context.gpa) |gpa| gpa else Error.uninitialized;
 }
 
+/// threadlocal scratch arena
 pub fn getArena() Error!*std.heap.ArenaAllocator {
     return if (thread_context.arena == null) Error.uninitialized else &thread_context.arena.?;
 }
