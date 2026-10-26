@@ -1,8 +1,6 @@
 const std = @import("std");
 const Lane = @import("Lane.zig");
 
-const assert = std.debug.assert;
-
 const ThreadContext = @This();
 
 lane: Lane = .single,
@@ -18,11 +16,3 @@ pub const uninitialized: ThreadContext = .{
     .gpa = null,
     .arena = null,
 };
-
-/// set the lane, returning previous lane (for nesting purposes)
-fn setLane(tctx: *ThreadContext, lane: Lane) Lane {
-    assert(tctx.initialized);
-    const prev_lane = tctx.lane;
-    tctx.lane = lane;
-    return prev_lane;
-}

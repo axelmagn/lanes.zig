@@ -12,7 +12,7 @@ pub const Error = Barrier.Error;
 
 index: u32,
 count: u32,
-/// slice of memory shared by all lanes
+/// memory shared by all lanes, used by `broadcast`
 broadcast_slot: *BroadcastSlot,
 barrier: *Barrier,
 
@@ -23,17 +23,28 @@ pub const single: Lane = .{
     .barrier = undefined,
 };
 
+pub const leader_index = 0;
+
+pub const Range = struct {
+    start: usize,
+    end: usize,
+
+    pub fn len(r: Range) usize {
+        return r.end - r.start;
+    }
+};
+
 pub const BroadcastSlot = struct {
     bytes: [cache_line]u8 align(cache_line) = undefined,
 };
 
 pub fn isLeader(lane: Lane) bool {
-    return lane.index == 0;
+    return lane.index == leader_index;
 }
 
 pub fn isSingle(lane: Lane) bool {
     if (lane.count == 1) {
-        std.debug.assert(lane.index == 0);
+        assert(lane.index == 0);
         return true;
     }
     return false;
@@ -82,13 +93,13 @@ test range {
 }
 
 /// Poison the lane group so every lane blocked in (or later entering) `sync`/`broadcast`
-/// returns `err`.  Intended to be called by whoever owns the lane's body when it fails.
-pub fn abort(lane: *Lane, io: std.Io) void {
+/// returns `error.aborted`.  Intended to be called by whoever owns the lane's body when it fails.
+pub fn abort(lane: Lane, io: std.Io) void {
     if (lane.isSingle()) return;
     lane.barrier.abort(io);
 }
 
-pub fn sync(lane: *Lane, io: std.Io) Error!void {
+pub fn sync(lane: Lane, io: std.Io) Error!void {
     // single lane case
     if (lane.isSingle()) return;
     try lane.barrier.wait(io);
@@ -104,9 +115,8 @@ test sync {
 
     const Worker = struct {
         fn run(lane: Lane, d: *[num_lanes]u32, io_: std.Io) anyerror!void {
-            var l = lane;
-            d[l.index] = l.index + 1;
-            try l.sync(io_);
+            d[lane.index] = lane.index + 1;
+            try lane.sync(io_);
             // after sync, every lane sees every other lane's write
             try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4 }, d);
         }
@@ -126,13 +136,13 @@ test sync {
 }
 
 pub fn broadcast(
-    lane: *Lane,
+    lane: Lane,
     /// type of data being broadcast
     T: type,
-    /// source pointer  on src lane, destination pointer on all other lanes
+    /// source pointer on src lane, destination pointer on all other lanes
     broadcast_ptr: *T,
     /// index of the source lane
-    source_lane_index: u32,
+    source_lane_index: usize,
     io: std.Io,
 ) Error!void {
     comptime {
@@ -144,7 +154,7 @@ pub fn broadcast(
 
     // copy to broadcast memory on source lane
     const len = @sizeOf(T);
-    if (source_lane_index == lane.index) {
+    if (source_lane_index == @as(usize, lane.index)) {
         const src: []u8 = std.mem.asBytes(broadcast_ptr);
         const dst: []u8 = lane.broadcast_slot.bytes[0..len];
         assert(src.len == len);
@@ -155,7 +165,7 @@ pub fn broadcast(
     try lane.barrier.wait(io);
 
     // copy from broadcast memory on destination lanes
-    if (source_lane_index != lane.index) {
+    if (source_lane_index != @as(usize, lane.index)) {
         const src: []u8 = lane.broadcast_slot.bytes[0..len];
         const dst: []u8 = std.mem.asBytes(broadcast_ptr);
         assert(src.len == len);
@@ -176,11 +186,10 @@ test broadcast {
 
     const Worker = struct {
         fn run(lane: Lane, io_: std.Io) anyerror!void {
-            var l = lane;
             // two rounds with different sources, to check the slot can be reused
-            for ([_]u32{ 0, num_lanes - 1 }) |source| {
-                var value: u32 = if (l.index == source) 100 + source else 0;
-                try l.broadcast(u32, &value, source, io_);
+            for ([_]usize{ 0, num_lanes - 1 }) |source| {
+                var value: usize = if (lane.index == source) 100 + source else 0;
+                try lane.broadcast(usize, &value, source, io_);
                 try std.testing.expectEqual(100 + source, value);
             }
         }
@@ -193,12 +202,3 @@ test broadcast {
     }
     for (&futures) |*f| try f.await(io);
 }
-
-pub const Range = struct {
-    start: usize,
-    end: usize,
-
-    pub fn len(r: Range) usize {
-        return r.end - r.start;
-    }
-};

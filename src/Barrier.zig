@@ -13,11 +13,6 @@ aborted: std.atomic.Value(bool) = .init(false),
 
 pub const Error = error{aborted};
 
-
-pub fn check(barrier: *Barrier) Error!void {
-    if (barrier.aborted.load(.acquire)) return error.aborted;
-}
-
 pub fn wait(barrier: *Barrier, io: std.Io) Error!void {
     // fail fast: an aborted barrier will never fill
     try barrier.check();
@@ -81,7 +76,7 @@ test wait {
 }
 
 pub fn abort(barrier: *Barrier, io: std.Io) void {
-    _ = barrier.aborted.store(true, .release);
+    barrier.aborted.store(true, .release);
     // Change the futex word so a waiter that checked `abort` just before this can't go to sleep.
     _ = barrier.generation.fetchAdd(1, .seq_cst);
     io.futexWake(u32, &barrier.generation.raw, std.math.maxInt(u32));
@@ -102,4 +97,8 @@ test abort {
 
     // sticky: later waits fail immediately
     try std.testing.expectError(error.aborted, barrier.wait(io));
+}
+
+fn check(barrier: *Barrier) Error!void {
+    if (barrier.aborted.load(.acquire)) return error.aborted;
 }

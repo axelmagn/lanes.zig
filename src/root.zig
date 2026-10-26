@@ -8,10 +8,14 @@ const ArgsTuple = std.meta.ArgsTuple;
 /// thread local static variable tracking thread state
 threadlocal var thread_context: ThreadContext = .uninitialized;
 
+pub const leader_index = Lane.leader_index;
+
 pub const Error = error{
     uninitialized,
     zero_lanes,
 } || Lane.Error;
+
+pub const Range = Lane.Range;
 
 pub fn init(gpa: std.mem.Allocator, io: std.Io) void {
     thread_context = .{ .gpa = gpa, .io = io, .arena = .init(gpa) };
@@ -24,46 +28,68 @@ pub fn deinit() void {
 
 pub const LaunchError = Error || std.Thread.SpawnError || error{OutOfMemory};
 
+/// The error set of a lane function: empty for `void`, otherwise that of its `E!void` return type.
+fn FnErrorSet(comptime F: type) type {
+    const ret = @typeInfo(F).@"fn".return_type.?;
+    return switch (@typeInfo(ret)) {
+        .void => error{},
+        .error_union => |eu| if (eu.payload == void)
+            eu.error_set
+        else
+            @compileError("launch: function must return void or an error union with a void payload"),
+        else => @compileError("launch: function must return void or an error union with a void payload"),
+    };
+}
+
 /// launch a function across `lanes` lanes, and wait for all of them to finish.
 /// The calling thread runs lane 0; the rest run on new threads.
+///
+/// `function` may return `void` or `E!void`.  If any lane returns an error, the lane group is
+/// aborted (lanes blocked in `sync`/`broadcast` get `error.aborted`) and `launch` returns the
+/// first error that was raised, once every lane has finished.
 pub fn launch(
-    lanes: u32,
+    lane_count: usize,
     comptime function: anytype,
     args: ArgsTuple(@TypeOf(function)),
-) LaunchError!void {
-    comptime if (@typeInfo(@TypeOf(function)).@"fn".return_type.? != void)
-        @compileError("launch: function must return void");
-
-    if (lanes == 0) return Error.zero_lanes;
+) (LaunchError || FnErrorSet(@TypeOf(function)))!void {
+    if (lane_count == 0) return Error.zero_lanes;
 
     const arena = try getArena();
     const io = try getIo();
-    var barrier: Barrier = .{ .expected = lanes };
+    var barrier: Barrier = .{ .expected = @intCast(lane_count) };
     var slot: Lane.BroadcastSlot = .{};
+    // first error raised by any lane, as an `@intFromError` code.  0 means none.
+    var first_err: std.atomic.Value(u16) = .init(0);
     var lane: Lane = .{
         .index = 0,
-        .count = lanes,
+        .count = @intCast(lane_count),
         .broadcast_slot = &slot,
         .barrier = &barrier,
     };
 
     // allocate before any lane runs: lane 0 swaps out thread_context.arena while it executes
-    const threads = try arena.allocator().alloc(std.Thread, lanes - 1);
+    const threads = try arena.allocator().alloc(std.Thread, lane_count - 1);
 
-    var spawned: usize = 0;
-    // join before barrier and slot leave scope
-    defer for (threads[0..spawned]) |t| t.join();
-    // if a spawn fails, release lanes already waiting on the barrier
-    errdefer barrier.abort(io);
+    {
+        var spawned: usize = 0;
+        // join before barrier, slot and first_err leave scope
+        defer for (threads[0..spawned]) |t| t.join();
+        // if a spawn fails, release lanes already waiting on the barrier
+        errdefer barrier.abort(io);
 
-    for (threads, 1..) |*t, i| {
-        lane.index = @intCast(i);
-        t.* = try std.Thread.spawn(.{}, runOnLane, .{ lane, thread_context, function, args });
-        spawned += 1;
+        for (threads, 1..) |*t, i| {
+            lane.index = @intCast(i);
+            t.* = try std.Thread.spawn(.{}, runOnLane, .{ lane, thread_context, &first_err, function, args });
+            spawned += 1;
+        }
+
+        lane.index = 0;
+        runOnLane(lane, thread_context, &first_err, function, args);
     }
 
-    lane.index = 0;
-    runOnLane(lane, thread_context, function, args);
+    // every lane has finished, so this is the root cause rather than a follow-on `aborted`
+    const code = first_err.load(.acquire);
+    if (code != 0) return @errorCast(@errorFromInt(code));
 }
 
 test launch {
@@ -71,11 +97,11 @@ test launch {
     defer deinit();
 
     const worker = struct {
-        fn run(counter: *std.atomic.Value(u32), expected: u32) void {
+        fn run(counter: *std.atomic.Value(u32), expected: u32) !void {
             _ = counter.fetchAdd(1, .monotonic);
-            sync() catch unreachable;
-            std.testing.expectEqual(expected, getCount()) catch unreachable;
-            std.testing.expectEqual(expected, counter.load(.monotonic)) catch unreachable;
+            try sync();
+            try std.testing.expectEqual(expected, getCount());
+            try std.testing.expectEqual(expected, counter.load(.monotonic));
         }
     };
 
@@ -92,6 +118,7 @@ test launch {
 fn runOnLane(
     lane: Lane,
     parent: ThreadContext,
+    first_err: *std.atomic.Value(u16),
     function: anytype,
     args: ArgsTuple(@TypeOf(function)),
 ) void {
@@ -101,25 +128,78 @@ fn runOnLane(
     thread_context.lane = lane;
     thread_context.arena = .init(parent.gpa.?);
     defer thread_context.arena.?.deinit();
-    @call(.auto, function, args);
+
+    const return_type = @typeInfo(@TypeOf(function)).@"fn".return_type.?;
+    const can_fail = @typeInfo(return_type) == .error_union;
+
+    // a `void` function has nothing to report
+    if (!can_fail) return @call(.auto, function, args);
+
+    @call(.auto, function, args) catch |err| {
+        const io = parent.io.?;
+
+        // Record before aborting: the abort makes the other lanes fail with `error.aborted`,
+        // and that must not get in ahead of the error that caused it.  Only the first
+        // error is kept; a lane that loses the race has nothing more to do with its error.
+        const no_error = 0;
+        _ = first_err.cmpxchgStrong(no_error, @intFromError(err), .acq_rel, .acquire);
+
+        // release the lanes still waiting on this one
+        lane.abort(io);
+    };
 }
 
-pub fn sync() anyerror!void {
+pub fn abort() void {
+    // we can fail silently here: if there's no thread IO, there's no barrier
+    // and no sync
+    const io = thread_context.io orelse return;
+    thread_context.lane.abort(io);
+}
+
+pub fn sync() Error!void {
     try thread_context.lane.sync(try getIo());
 }
 
-pub fn broadcast(T: type, broadcast_ptr: *T, source_lane_index: u32) Error!void {
+pub fn broadcast(T: type, broadcast_ptr: *T, source_lane_index: usize) Error!void {
     try thread_context.lane.broadcast(T, broadcast_ptr, source_lane_index, try getIo());
 }
 
+/// this lane's share of `n` items, split evenly across the lanes in the group
+pub fn getRange(n: usize) Range {
+    return thread_context.lane.range(n);
+}
+
+test getRange {
+    init(std.testing.allocator, std.testing.io);
+    defer deinit();
+
+    const n = 1003;
+    const worker = struct {
+        fn run(ranges: []Range) void {
+            ranges[getIndex()] = getRange(n);
+        }
+    };
+
+    var ranges: [7]Range = undefined;
+    try launch(ranges.len, worker.run, .{&ranges});
+
+    // together the lanes cover 0..n exactly, in order
+    var next: usize = 0;
+    for (ranges) |r| {
+        try std.testing.expectEqual(next, r.start);
+        next = r.end;
+    }
+    try std.testing.expectEqual(n, next);
+}
+
 /// lane index
-pub fn getIndex() u32 {
-    return thread_context.lane.index;
+pub fn getIndex() usize {
+    return @intCast(thread_context.lane.index);
 }
 
 /// number of lanes in group
-pub fn getCount() u32 {
-    return thread_context.lane.count;
+pub fn getCount() usize {
+    return @intCast(thread_context.lane.count);
 }
 
 /// is current lane leader
@@ -145,7 +225,7 @@ pub fn getArena() Error!*std.heap.ArenaAllocator {
 }
 
 test {
-    _ = std.testing.refAllDecls(@This());
+    std.testing.refAllDecls(@This());
     // refAllDecls only sees pub decls, so reference the private imports explicitly
     _ = Barrier;
     _ = Lane;
