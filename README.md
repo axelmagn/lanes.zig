@@ -1,18 +1,18 @@
 # lanes.zig
 
-A Zig parallelism library based on [Multi-Core by
-Default](https://www.dgtlgrove.com/p/multi-core-by-default) by Ryan Fleury.
+A Zig parallelism library based on
+[Multi-Core by Default](https://www.dgtlgrove.com/p/multi-core-by-default) by
+Ryan Fleury.
 
 This library allows the user to write "CPU kernels" and manage them via thread
-lanes.  CPU kernels resemble GPU kernels in CUDA or shaders: they execute
+lanes. CPU kernels resemble GPU kernels in CUDA or shaders: they execute
 sequentially on multiple threads, coordinated by synchronization barriers and
 broadcasts.
 
 It exposes a simple, opinionated API mediated by thread-local static variables.
 
-Examples can be found in the `examples` directory, and can be built with `zig
-build examples`.
-
+Examples can be found in the `examples` directory, and can be built with
+`zig build examples`.
 
 ## Installation
 
@@ -89,15 +89,19 @@ fn kernel(data: []const u64) !void {
 }
 ```
 
-
 ## Versioning
 
 This library is still experimental - expect API changes between minor versions.
 
 `main` branch builds against latest stable zig (0.17 at time of writing).
 
-Latest library versions are tagged with semantic versioning:
-`v<major>.<minor>`. Subminor versions are omitted.
+Latest library versions are tagged with semantic versioning: `v<major>.<minor>`.
+Subminor versions are omitted.
 
 When subsequent versions of zig release, the latest version of the library
 supporting old versions of zig will be tagged with `zig-<version>`.
+
+## LLM Usage
+
+This code is mostly hand-written. LLM coding agents were used for
+troubleshooting, test authoring, and prototyping.
