@@ -10,10 +10,11 @@ threadlocal var thread_context: ThreadContext = .uninitialized;
 
 pub const leader_index = Lane.leader_index;
 
-pub const Error = error{
-    uninitialized,
-    zero_lanes,
-} || Lane.Error;
+/// returned by anything that needs the thread's context when `init` hasn't been called
+pub const Error = error{uninitialized};
+
+/// returned by the operations that coordinate lanes
+pub const SyncError = Error || Lane.Error;
 
 pub const Range = Lane.Range;
 
@@ -26,7 +27,7 @@ pub fn deinit() void {
     thread_context = .uninitialized;
 }
 
-pub const LaunchError = Error || std.Thread.SpawnError || error{OutOfMemory};
+pub const LaunchError = Error || std.Thread.SpawnError || error{ OutOfMemory, zero_lanes };
 
 /// The error set of a lane function: empty for `void`, otherwise that of its `E!void` return type.
 fn FnErrorSet(comptime F: type) type {
@@ -52,7 +53,7 @@ pub fn launch(
     comptime function: anytype,
     args: ArgsTuple(@TypeOf(function)),
 ) (LaunchError || FnErrorSet(@TypeOf(function)))!void {
-    if (lane_count == 0) return Error.zero_lanes;
+    if (lane_count == 0) return error.zero_lanes;
 
     const arena = try getArena();
     const io = try getIo();
@@ -112,7 +113,7 @@ test launch {
     }
 
     var counter: std.atomic.Value(u32) = .init(0);
-    try std.testing.expectError(Error.zero_lanes, launch(0, worker.run, .{ &counter, 0 }));
+    try std.testing.expectError(error.zero_lanes, launch(0, worker.run, .{ &counter, 0 }));
 }
 
 fn runOnLane(
@@ -156,11 +157,26 @@ pub fn abort() void {
     thread_context.lane.abort(io);
 }
 
-pub fn sync() Error!void {
+test abort {
+    init(std.testing.allocator, std.testing.io);
+    defer deinit();
+
+    const worker = struct {
+        fn run() SyncError!void {
+            // the leader gives up; everyone else would wait on it forever
+            if (isLeader()) return abort();
+            try sync();
+        }
+    };
+
+    try std.testing.expectError(error.aborted, launch(4, worker.run, .{}));
+}
+
+pub fn sync() SyncError!void {
     try thread_context.lane.sync(try getIo());
 }
 
-pub fn broadcast(T: type, broadcast_ptr: *T, source_lane_index: usize) Error!void {
+pub fn broadcast(T: type, broadcast_ptr: *T, source_lane_index: usize) SyncError!void {
     try thread_context.lane.broadcast(T, broadcast_ptr, source_lane_index, try getIo());
 }
 
